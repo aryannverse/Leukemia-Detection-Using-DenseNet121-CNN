@@ -13,6 +13,8 @@ import seaborn as sns
 import streamlit as st
 import tensorflow as tf
 from PIL import Image
+from tensorflow.keras import regularizers
+from tensorflow.keras.applications import DenseNet121
 from tensorflow.keras.applications.densenet import preprocess_input as densenet_preprocess
 
 st.set_page_config(
@@ -27,6 +29,11 @@ LOCAL_MODEL_PATH = "Models/densenet121-trained.keras"
 
 
 def _sanitize_keras_config(obj):
+    if isinstance(obj, dict) and obj.get("class_name") == "DTypePolicy":
+        cfg = obj.get("config", {})
+        if isinstance(cfg, dict) and "name" in cfg:
+            return cfg["name"]
+
     if isinstance(obj, dict):
         cleaned = {}
         for k, v in obj.items():
@@ -77,6 +84,59 @@ def _build_compat_keras_archive(model_path: str) -> str:
     return compat_model_path
 
 
+def _build_densenet121_classifier():
+    base_model = DenseNet121(
+        include_top=False,
+        weights=None,
+        input_shape=(224, 224, 3),
+        pooling="avg",
+    )
+    base_model.trainable = False
+
+    model = tf.keras.Sequential([
+        base_model,
+        tf.keras.layers.BatchNormalization(axis=-1, momentum=0.99, epsilon=0.001),
+        tf.keras.layers.Dense(256, activation="relu", kernel_regularizer=regularizers.l2(1e-4)),
+        tf.keras.layers.Dropout(rate=0.40, seed=123),
+        tf.keras.layers.Dense(2, activation="softmax"),
+    ])
+    return model
+
+
+def _load_from_archive_weights(model_path: str):
+    temp_dir = tempfile.mkdtemp(prefix="keras_weights_")
+    try:
+        with zipfile.ZipFile(model_path, "r") as zin:
+            zin.extractall(temp_dir)
+
+        candidates = [
+            os.path.join(temp_dir, "model.weights.h5"),
+            os.path.join(temp_dir, "variables.h5"),
+        ]
+        weights_path = None
+        for candidate in candidates:
+            if os.path.exists(candidate):
+                weights_path = candidate
+                break
+        if weights_path is None:
+            for root, _, files in os.walk(temp_dir):
+                for filename in files:
+                    if filename.endswith(".weights.h5") or filename.endswith("variables.h5"):
+                        weights_path = os.path.join(root, filename)
+                        break
+                if weights_path is not None:
+                    break
+
+        if weights_path is None:
+            raise FileNotFoundError("No weights file found inside .keras archive")
+
+        model = _build_densenet121_classifier()
+        model.load_weights(weights_path)
+        return model
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+
 @st.cache_resource
 def load_model_local(local_path: str):
     if not os.path.exists(local_path):
@@ -101,8 +161,17 @@ def load_model_local(local_path: str):
                 st.warning("Loaded model in compatibility mode (sanitized unsupported Keras config fields).")
                 return model
             except Exception as compat_e:
-                st.error(f"Error loading model from file: {e}\nCompatibility load failed: {compat_e}")
-                return None
+                try:
+                    model = _load_from_archive_weights(local_path)
+                    st.warning("Loaded model via weights fallback from .keras archive.")
+                    return model
+                except Exception as weights_e:
+                    st.error(
+                        f"Error loading model from file: {e}\n"
+                        f"Compatibility load failed: {compat_e}\n"
+                        f"Weights fallback failed: {weights_e}"
+                    )
+                    return None
         st.error(f"Error loading model from file: {e}")
         return None
 
@@ -259,7 +328,7 @@ elif app_mode == "Live Prediction":
                             prob_df = pd.DataFrame([pred_probs], columns=[c.upper() for c in CLASS_NAMES])
                             st.dataframe(prob_df.style.format("{:.2%}"))
     else:
-        st.error("Model could not be loaded. Please check that 'models/densenet121-trained.keras' is present in the app repository.")
+        st.error("Model could not be loaded. Please check that 'Models/densenet121-trained.keras' is present in the app repository.")
 
 st.markdown("---")
 st.markdown("Created based on Leukemia Classification Jupyter Notebook | Source: Repo")
