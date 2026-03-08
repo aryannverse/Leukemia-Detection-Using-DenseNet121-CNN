@@ -26,15 +26,28 @@ CLASS_NAMES = ["all", "hem"]
 LOCAL_MODEL_PATH = "Models/densenet121-trained.keras"
 
 
-def _strip_key_recursive(obj, key_to_remove):
+def _sanitize_keras_config(obj):
     if isinstance(obj, dict):
-        return {
-            k: _strip_key_recursive(v, key_to_remove)
-            for k, v in obj.items()
-            if k != key_to_remove
-        }
+        cleaned = {}
+        for k, v in obj.items():
+            if k == "quantization_config":
+                continue
+            if k == "optional":
+                continue
+            cleaned[k] = _sanitize_keras_config(v)
+
+        # Keras 3 -> tf.keras 2.x InputLayer compatibility.
+        if cleaned.get("class_name") == "InputLayer" and isinstance(cleaned.get("config"), dict):
+            cfg = cleaned["config"]
+            if "batch_shape" in cfg and "batch_input_shape" not in cfg:
+                cfg["batch_input_shape"] = cfg.pop("batch_shape")
+            else:
+                cfg.pop("batch_shape", None)
+            cfg.pop("optional", None)
+
+        return cleaned
     if isinstance(obj, list):
-        return [_strip_key_recursive(item, key_to_remove) for item in obj]
+        return [_sanitize_keras_config(item) for item in obj]
     return obj
 
 
@@ -47,7 +60,7 @@ def _build_compat_keras_archive(model_path: str) -> str:
     if os.path.exists(config_path):
         with open(config_path, "r", encoding="utf-8") as f:
             config = json.load(f)
-        config = _strip_key_recursive(config, "quantization_config")
+        config = _sanitize_keras_config(config)
         with open(config_path, "w", encoding="utf-8") as f:
             json.dump(config, f)
 
@@ -72,12 +85,20 @@ def load_model_local(local_path: str):
     try:
         return tf.keras.models.load_model(local_path, compile=False)
     except Exception as e:
-        if "quantization_config" in str(e):
+        err_text = str(e)
+        compat_markers = [
+            "quantization_config",
+            "batch_shape",
+            "optional",
+            "Error when deserializing class",
+            "Unrecognized keyword arguments",
+        ]
+        if any(marker in err_text for marker in compat_markers):
             try:
                 compat_path = _build_compat_keras_archive(local_path)
                 model = tf.keras.models.load_model(compat_path, compile=False)
                 shutil.rmtree(os.path.dirname(compat_path), ignore_errors=True)
-                st.warning("Loaded model in compatibility mode (removed unsupported quantization_config fields).")
+                st.warning("Loaded model in compatibility mode (sanitized unsupported Keras config fields).")
                 return model
             except Exception as compat_e:
                 st.error(f"Error loading model from file: {e}\nCompatibility load failed: {compat_e}")
